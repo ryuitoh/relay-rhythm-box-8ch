@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>USBRelay8 Rhythm Box</title>
+<style>
+  :root {
+    --bg: #121214;
+    --panel: #1e1e24;
+    --accent: #00e5ff;
+    --active: #ff3d71;
+    --step-now: rgba(255, 255, 255, 0.15);
+    --text: #e4e4e7;
+  }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container {
+    max-width: 960px;
+    width: 100%;
+    background: var(--panel);
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  h1 { margin: 0; font-size: 1.3rem; letter-spacing: 0.05em; }
+  .controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 12px;
+    background: #141418;
+    border-radius: 8px;
+  }
+  button {
+    background: #2b2b36;
+    color: var(--text);
+    border: 1px solid #3f3f4e;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: all 0.1s;
+  }
+  button:hover { background: #383846; }
+  button.primary { background: var(--accent); color: #000; border: none; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.playing { background: var(--active); color: #fff; border: none; }
+  .param { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }
+  input[type="range"] { accent-color: var(--accent); cursor: pointer; }
+  
+  .grid {
+    display: grid;
+    grid-template-columns: 90px repeat(16, 1fr);
+    gap: 4px;
+    align-items: center;
+  }
+  .ch-btn {
+    padding: 8px 6px;
+    font-size: 0.85rem;
+    text-align: left;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .ch-btn.firing {
+    background: var(--accent);
+    color: #000;
+  }
+  .step {
+    aspect-ratio: 1 / 1.2;
+    background: #26262f;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: transform 0.05s;
+  }
+  .step:nth-child(16n + 6),
+  .step:nth-child(16n + 10),
+  .step:nth-child(16n + 14) {
+    margin-left: 4px;
+  }
+  .step.on {
+    background: var(--active);
+    box-shadow: 0 0 8px rgba(255, 61, 113, 0.5);
+  }
+  .step.current {
+    border-color: var(--accent);
+    background-color: #3a3a48;
+  }
+  .step.on.current {
+    background: #ff7597;
+  }
+  .status { font-size: 0.85rem; color: #a1a1aa; }
+  .status.connected { color: #4ade80; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <div>
+      <h1>USBRelay8 RHYTHM BOX</h1>
+      <div id="status" class="status">未接続 (VID:0x16c0 / PID:0x05df)</div>
+    </div>
+    <button id="connectBtn" class="primary">USBRelay8 に接続</button>
+  </header>
+
+  <div class="controls">
+    <button id="playBtn">▶ PLAY</button>
+    <button id="presetBtn">サンプルパターン</button>
+    <button id="clearBtn">クリア</button>
+    
+    <div class="param">
+      <label>BPM: <span id="bpmVal">120</span></label>
+      <input type="range" id="bpm" min="60" max="200" value="120">
+    </div>
+    
+    <div class="param">
+      <label>パルス幅: <span id="pulseVal">35</span>ms</label>
+      <input type="range" id="pulse" min="15" max="80" value="35">
+    </div>
+  </div>
+
+  <div id="grid" class="grid"></div>
+</div>
+
+<script>
+const VENDOR_ID = 0x16c0;
+const PRODUCT_ID = 0x05df;
+const NUM_CHANNELS = 8;
+const NUM_STEPS = 16;
+
+let device = null;
+let isPlaying = false;
+let currentStep = 0;
+let timerId = null;
+
+// 8ch x 16steps パターン配列
+const pattern = Array.from({ length: NUM_CHANNELS }, () => Array(NUM_STEPS).fill(false));
+const offTimers = Array(NUM_CHANNELS).fill(null);
+
+// HIDコマンド送信キュー（V-USBのパケット衝突防止用）
+let hidQueue = Promise.resolve();
+
+function sendRelayCommand(cmd, channel) {
+  if (!device || !device.opened) return;
+  // DCTTECH USBRelay HID Feature Report フォーマット (8 bytes)
+  // 0xFF: 個別ON, 0xFD: 個別OFF, 0xFC: 全OFF
+  const data = new Uint8Array([cmd, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  hidQueue = hidQueue
+    .then(() => device.sendFeatureReport(0x00, data))
+    .catch(err => console.error('HID Send Error:', err));
+}
+
+// 1ショットパルス駆動（カチッと鳴らしてすぐ戻す）
+function triggerRelay(chIndex) {
+  const chNum = chIndex + 1; // 1-based (1..8)
+  const pulseMs = parseInt(document.getElementById('pulse').value, 10);
+
+  // UIフィードバック
+  const btn = document.getElementById(`ch-btn-${chIndex}`);
+  if (btn) btn.classList.add('firing');
+
+  // リレーON
+  sendRelayCommand(0xFF, chNum);
+
+  // 既存タイマーがあればリセットして指定時間後にOFF
+  if (offTimers[chIndex]) clearTimeout(offTimers[chIndex]);
+  offTimers[chIndex] = setTimeout(() => {
+    sendRelayCommand(0xFD, chNum);
+    if (btn) btn.classList.remove('firing');
+  }, pulseMs);
+}
+
+function allRelaysOff() {
+  sendRelayCommand(0xFC, 0x00);
+}
+
+// WebHID 接続処理
+document.getElementById('connectBtn').addEventListener('click', async () => {
+  try {
+    const devices = await navigator.hid.requestDevice({
+      filters: [{ vendorId: VENDOR_ID, productId: PRODUCT_ID }]
+    });
+    if (devices.length === 0) return;
+
+    device = devices[0];
+    if (!device.opened) {
+      await device.open();
+    }
+    allRelaysOff();
+
+    const statusEl = document.getElementById('status');
+    statusEl.textContent = `接続済み: ${device.productName || 'USBRelay8'}`;
+    statusEl.classList.add('connected');
+  } catch (err) {
+    alert('接続に失敗しました: ' + err.message);
+  }
+});
+
+// UIグリッド生成
+const gridEl = document.getElementById('grid');
+for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+  const chBtn = document.createElement('button');
+  chBtn.className = 'ch-btn';
+  chBtn.id = `ch-btn-${ch}`;
+  chBtn.innerHTML = `<span>CH ${ch + 1}</span><span>●</span>`;
+  chBtn.addEventListener('click', () => triggerRelay(ch));
+  gridEl.appendChild(chBtn);
+
+  for (let step = 0; step < NUM_STEPS; step++) {
+    const cell = document.createElement('div');
+    cell.className = 'step';
+    cell.dataset.ch = ch;
+    cell.dataset.step = step;
+    cell.addEventListener('click', () => {
+      pattern[ch][step] = !pattern[ch][step];
+      cell.classList.toggle('on', pattern[ch][step]);
+    });
+    gridEl.appendChild(cell);
+  }
+}
+
+function updateGridUI() {
+  document.querySelectorAll('.step').forEach(cell => {
+    const ch = parseInt(cell.dataset.ch, 10);
+    const step = parseInt(cell.dataset.step, 10);
+    cell.classList.toggle('on', pattern[ch][step]);
+    cell.classList.toggle('current', isPlaying && step === currentStep);
+  });
+}
+
+// シーケンサー進行
+function tick() {
+  for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+    if (pattern[ch][currentStep]) {
+      triggerRelay(ch);
+    }
+  }
+  updateGridUI();
+  currentStep = (currentStep + 1) % NUM_STEPS;
+}
+
+function startSequencer() {
+  if (isPlaying) return;
+  isPlaying = true;
+  currentStep = 0;
+  const playBtn = document.getElementById('playBtn');
+  playBtn.textContent = '■ STOP';
+  playBtn.classList.add('playing');
+
+  const schedule = () => {
+    if (!isPlaying) return;
+    tick();
+    const bpm = parseInt(document.getElementById('bpm').value, 10);
+    const stepMs = (60 / bpm / 4) * 1000; // 16分音符間隔
+    timerId = setTimeout(schedule, stepMs);
+  };
+  schedule();
+}
+
+function stopSequencer() {
+  isPlaying = false;
+  clearTimeout(timerId);
+  allRelaysOff();
+  const playBtn = document.getElementById('playBtn');
+  playBtn.textContent = '▶ PLAY';
+  playBtn.classList.remove('playing');
+  updateGridUI();
+}
+
+// イベントリスナー
+document.getElementById('playBtn').addEventListener('click', () => {
+  isPlaying ? stopSequencer() : startSequencer();
+});
+
+document.getElementById('bpm').addEventListener('input', (e) => {
+  document.getElementById('bpmVal').textContent = e.target.value;
+});
+
+document.getElementById('pulse').addEventListener('input', (e) => {
+  document.getElementById('pulseVal').textContent = e.target.value;
+});
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+    pattern[ch].fill(false);
+  }
+  updateGridUI();
+});
+
+document.getElementById('presetBtn').addEventListener('click', () => {
+  for (let ch = 0; ch < NUM_CHANNELS; ch++) pattern[ch].fill(false);
+  // 4つ打ち＋裏打ち＋フィルインのデモパターン
+  [0, 4, 8, 12].forEach(s => pattern[0][s] = true);
+  [4, 12].forEach(s => pattern[1][s] = true);
+  [2, 6, 10, 14].forEach(s => pattern[2][s] = true);
+  [0, 3, 6, 10, 12, 15].forEach(s => pattern[3][s] = true);
+  [14, 15].forEach(s => pattern[7][s] = true);
+  updateGridUI();
+});
+
+// ページ離脱時に全リレーOFF
+window.addEventListener('beforeunload', allRelaysOff);
+</script>
+</body>
+</html>
